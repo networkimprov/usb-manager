@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-#define BUF_SZ		100
+#define BUF_SZ		1024
 
 #define F_IINLIM_PC	(1 << 5)
 #define F_VBUS_STAT_PC	(1 << 4)
@@ -17,6 +17,8 @@
 #define B_PERIPHERAL	(1 << 2)
 #define B_IDLE		(1 << 1)
 #define VBUS		(1 << 0)
+
+#define B_IDLE_VBUS(s)	((s) == (B_IDLE | VBUS))
 
 struct files {
 	char *desc;
@@ -41,6 +43,8 @@ static struct files sysfs[] = {
 	{ /* Sentinel */ },
 };
 
+static int debug;
+
 /*
  * Sets things based on sysfs vbus state as otherwise running
  * ttyGS0 will keep the system busy.
@@ -57,6 +61,8 @@ static int parse_sysfs(struct files *f, char *val, unsigned int *status)
 
 	/* MUSB provides multiple values.. */
 	if (f->mask == B_IDLE) {
+		if (!strcmp("(null)", val))
+			*status |= B_IDLE;
 		if (!strcmp("b_peripheral", val))
 			*status |= B_PERIPHERAL;
 		else
@@ -148,53 +154,218 @@ out:
 	if (old_status != *status)
 		*status_changed = 1;
 
-	printf("status: 0x%08x status changed: %i\n", *status, *status_changed);
+	if (debug)
+		printf("Poll sysfs_notify events status: 0x%08x status changed: %i\n",
+		       *status, *status_changed);
 
 	ret = sigprocmask(SIG_SETMASK, &orig_mask, NULL);
 
 	return 0;
 }
 
-static int configure_charger_led(int value)
+static int read_sysfs_entry(const char *file, char *buf)
 {
-	char buf[256];
-	int res;
+	ssize_t len;
+	int fd;
 
-	sprintf(buf,
-		"/usr/bin/echo %i > /sys/class/leds/pca963x:blue/brightness",
-		value);
-	res = system(buf);
+	fd = open(file, O_RDONLY);
+	if (fd < 1 )
+		return fd;
+	len = read(fd, buf, BUF_SZ);
+	close(fd);
+	if (len < 1)
+		return 0;
+	if (len > 1) {
+		len--;
+		buf[len] = 0;
+	}
 
-	return res;
+	return len;
 }
 
-static int configure_charger(int connected, int pc)
+static int write_sysfs_entry(const char *file, const char *val, size_t count)
 {
-	if (connected) {
-		int fd, f_iinlim;
-		ssize_t len;
+	ssize_t len;
+	int fd;
+
+	fd = open(file, O_RDWR);
+	if (fd < 1 )
+		return fd;
+	len = write(fd, val, count);
+	if (len < count)
+		return -EINVAL;
+	close(fd);
+
+	return len;
+}
+
+
+static int configure_charger_led(int value)
+{
+	char val[32];
+	ssize_t len;
+	const char *name =
+		"/sys/class/leds/pca963x:blue/brightness";
+	sprintf(val, "%i\n", value);
+	len = write_sysfs_entry(name, val, strlen(val)); 
+	if (len < 0)
+		return len;
+
+	return 0;
+}
+
+#define MAX_CURRENT	8
+
+/* Charger current in mA */
+static const unsigned int charger_current[MAX_CURRENT] = {
+	100,
+	150,
+	500,
+	900,
+	1200,
+	1500,
+	2000,
+	3000,
+};
+
+/* Charger type detected by bq24190 */
+enum charger_type {
+	CHARGER_UNKNOWN = 0,
+	CHARGER_USBHOST,
+	CHARGER_ADAPTER,
+	CHARGER_OTG,
+};
+
+static int force_charger_current(int val, const char *desc)
+{
+	const char *file_f_iinlim =
+		"/sys/class/power_supply/bq24190-charger/f_iinlim";
+	char buf[8];
+	int res;
+
+	if (val > 7)
+		val = 7;
+
+	sprintf(buf, "%i\n", val);
+	if (desc)
+		fprintf(stderr, "WARNING: Forcing charger current, %s\n",
+			desc);
+	res = write_sysfs_entry(file_f_iinlim, buf, 2);
+	if (res < 0)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int dumb_charger_retries;
+
+static int configure_charger(unsigned int status)
+{
+	int res, b_idle, enumerated, charging;
+
+	if (!status)
+		goto out;
+
+	b_idle = (status & (B_IDLE | VBUS)) == ((B_IDLE | VBUS));
+	enumerated = ((status & (B_PERIPHERAL | VBUS)) == (B_PERIPHERAL | VBUS));
+	charging = (status & CHARGING);
+
+	if (b_idle || enumerated || charging) {
+		const char *file_f_iinlim =
+			"/sys/class/power_supply/bq24190-charger/f_iinlim";
+		const char *file_f_vbus_stat =
+			"/sys/class/power_supply/bq24190-charger/f_vbus_stat";
+		const char *file_battery_stat =
+			"/sys/class/power_supply/bq24190-battery/status";
+
+		int f_iinlim, f_vbus_stat;
+		unsigned int current;
 		char buf[BUF_SZ];
+		char *charger_desc;
 
-		fd = open("/sys/class/power_supply/bq24190-charger/f_iinlim",
-			  O_RDONLY);
-		if (fd < 1 )
-			return fd;
+		res = read_sysfs_entry(file_f_iinlim, buf);
+		if (res < 1)
+			return -EINVAL;
+		f_iinlim = atoi(buf);
+		if (f_iinlim >= MAX_CURRENT)
+			f_iinlim = 0;
 
-		len = read(fd, buf, BUF_SZ);
-		if (len < 1) {
-			close(fd);
-			return len;
+		res = read_sysfs_entry(file_f_vbus_stat, buf);
+		if (res < 1)
+			return -EINVAL;
+		f_vbus_stat = atoi(buf);
+
+		switch (f_vbus_stat) {
+		case CHARGER_UNKNOWN:
+			charger_desc = "unkown";
+			dumb_charger_retries++;
+
+			/* Workaround for dumb charger with d+ and d- shorted */
+			if ((dumb_charger_retries > 2) && b_idle && (f_iinlim) == 0) {
+				res = force_charger_current(5,
+					"1500mA, dumb charger?");
+				if (res < 0)
+					return -EINVAL;
+				f_iinlim = 5;
+			}
+			break;
+		case CHARGER_USBHOST:
+			charger_desc = "USB host";
+			dumb_charger_retries = 0;
+
+			/* Workaround for bq24190 OTG pin being high */
+			if (b_idle && (f_iinlim > 0)) {
+				res = force_charger_current(0,
+					"100mA, OTG pin high?");
+				if (res < 0)
+					return -EINVAL;
+				f_iinlim = 0;
+			} else if (enumerated && (f_iinlim == 0)) {
+				res = force_charger_current(2,
+					"500mA, configured while charging?");
+				if (res < 0)
+					return -EINVAL;
+				f_iinlim = 2;
+			}
+			break;
+		case CHARGER_ADAPTER:
+			charger_desc = "adapter port";
+			dumb_charger_retries = 0;
+			break;
+		case CHARGER_OTG:
+			charger_desc = "OTG";
+			dumb_charger_retries = 0;
+			break;
+		default:
+			dumb_charger_retries = 0;
+			break;
 		}
 
-		if (len > 1)
-			buf[len - 1] = 0;
+		res = read_sysfs_entry(file_battery_stat, buf);
+		if (res < 1)
+			return -EINVAL;
 
-		f_iinlim = atoi(buf);
+		current = charger_current[f_iinlim];
 
-		configure_charger_led(1 + (32 * f_iinlim));
-	} else {
-		configure_charger_led(0);
+		if (debug)
+			printf("%s %s %s charger %umA iinlim: %i vbus: %i\n",
+			       buf, enumerated ? "enumerated" : "b_idle",
+			       charger_desc, current, f_iinlim, f_vbus_stat);
+
+		if (!strcmp("Full", buf))
+			configure_charger_led(0);
+		else
+			configure_charger_led(1 + (32 * f_iinlim));
+
+		return 0;
 	}
+
+out:
+	dumb_charger_retries = 0;
+	configure_charger_led(0);
+	res = force_charger_current(0, NULL);
+	if (res < 0)
+		return -EINVAL;
 
 	return 0;
 }
@@ -239,7 +410,6 @@ static int configure_usb_console(int connected)
 		return res;
 	}
 
-	signal(SIGCHLD, SIG_DFL);
 	pid = fork();
 	if (pid < 0) {
 		printf("ERROR: Could not fork\n");
@@ -258,17 +428,32 @@ static int configure_usb_console(int connected)
 
 void signal_handler(int signal)
 {
-	configure_charger(0, 0);
+	configure_charger(0);
 	configure_usb_console(0);
 	exit(0);
 }
 
+#define TIMEOUT_DEFAULT_MS	20000
+
 int main(int argc, char **argv)
 {
-	int ret, status_changed;
+	int ret, status_changed, recheck = 0, timeout_ms = 1;
 	sigset_t mask;
 	struct sigaction act;
 	unsigned int status;
+
+	if (argc > 1) {
+		if (!strcmp(argv[1], "--help")) {
+			printf("Usage: %s [--help|--debug]\n", argv[0]);
+			return 0;
+		}
+		if (!strcmp(argv[1], "--debug")) {
+			debug = 1;
+		} else {
+			fprintf(stderr, "ERROR: Invalid argument %s\n", argv[1]);
+			return -EINVAL;
+		}
+	}
 
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = signal_handler;
@@ -280,50 +465,38 @@ int main(int argc, char **argv)
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 
-	/* Check initial state */
-	ret = poll_vbus(sysfs, 1, mask, &status_changed, &status);
-	if (ret)
-		return ret;
-
-	ret = configure_charger(status & CHARGING, status & B_PERIPHERAL);
-	if (ret)
-		return ret;
-
-	if (status & B_PERIPHERAL) {
-		ret = configure_usb_console(1);
-		if (ret)
-			return ret;
-	}
-
 	/* Keep checking when state changes */
 	while (1) {
-		ret = poll_vbus(sysfs, 5000, mask, &status_changed, &status);
+		ret = poll_vbus(sysfs, timeout_ms, mask, &status_changed, &status);
 		if (ret)
 			return ret;
 
-		while (status_changed)  {
-			int previous = status;
-
-			ret = configure_charger(status & CHARGING, status & B_PERIPHERAL);
+		if (status_changed || recheck)  {
+			ret = configure_charger(status);
 			if (ret)
 				return ret;
+		}
 
+		if (status_changed) {
 			ret = configure_usb_console(status & B_PERIPHERAL);
 			if (ret)
 				return ret;
-
-			/* Did status change? */
-			ret = poll_vbus(sysfs, 1, mask, &status_changed, &status);
-			if (ret)
-				return ret;
-
-			if (previous != status)
-				status_changed = 1;
 		}
 
 		if (ret != 0) {
 			printf("Polling failed with %i\n", ret);
 			break;
+		}
+
+		if (status & CHARGING) {
+			timeout_ms = 5000;
+			recheck = 1;
+		} else if (B_IDLE_VBUS(status) || (status & B_PERIPHERAL)) {
+			timeout_ms = 1000;
+			recheck = 1;
+		} else {
+			timeout_ms = TIMEOUT_DEFAULT_MS;
+			recheck = 0;
 		}
 	}
 

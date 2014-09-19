@@ -8,6 +8,7 @@
 #include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <usbg/usbg.h>
 
 #define BUF_SZ		1024
 
@@ -370,6 +371,143 @@ out:
 	return 0;
 }
 
+#define UDC		"musb-hdrc.0.auto"
+#define UDC_SZ		32
+#define VENDOR		0x1d6b
+#define PRODUCT		0x0106
+
+/*
+ * Based on the libusbg example at:
+ * https://github.com/libusbg/libusbg/blob/master/examples/gadget-acm-ecm.c
+ */
+static int configure_usb_gadget(int connected)
+{
+	usbg_state *s;
+	usbg_gadget *g;
+	usbg_config *c;
+	usbg_function *f_acm0, *f_ecm;
+	int ret;
+
+	/* We need minimum 700ms sleep for bq24190 charger detection */
+	sleep(1);
+
+	usbg_gadget_attrs g_attrs = {
+			0x0200,			/* bcdUSB */
+			0x00,			/* Defined at interface level */
+			0x00,			/* subclass */
+			0x00,			/* device protocol */
+			0x0040,			/* Max allowed packet size */
+			VENDOR,
+			PRODUCT,
+			0x0001,			/* Verson of device */
+	};
+
+	usbg_gadget_strs g_strs = {
+			"0123456789",		/* Serial number */
+			"NetworkImprov",	/* Manufacturer */
+			"Anvl"			/* Product string */
+	};
+
+	usbg_config_strs c_strs = {
+			"CDC ACM+ECM"
+	};
+
+	ret = usbg_init("/sys/kernel/config", &s);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: init %s :%s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		return -EINVAL;
+	}
+
+	g = usbg_get_first_gadget(s);
+	if (!g && !connected)
+		goto out;
+
+	if (g) {
+		if (connected) {
+			char buf[UDC_SZ];
+			ssize_t len;
+
+			len = usbg_get_gadget_udc_len(g);
+			if (len < 0)
+				goto out;
+			ret = usbg_get_gadget_udc(g, buf, len);
+			if (ret < 0)
+				goto out;
+			if (!strcmp(UDC, buf))
+				goto out;
+			if (debug)
+				printf("Enabling USB gadget\n");
+			ret = usbg_enable_gadget(g, "musb-hdrc.0.auto");
+			if (ret)
+				goto out;
+		} else {
+			if (debug)
+				printf("Disabling USB gadget\n");
+			ret = usbg_disable_gadget(g);
+			if (ret)
+				goto out;
+		}
+		goto out;
+	}
+
+	ret = usbg_create_gadget(s, "g1", &g_attrs, &g_strs, &g);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: create %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+	ret = usbg_create_function(g, F_ACM, "usb0", NULL, &f_acm0);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: F_ACM %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+	ret = usbg_create_function(g, F_ECM, "usb0", NULL, &f_ecm);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: F_ECM %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+	/* NULL can be passed to use kernel defaults */
+	ret = usbg_create_config(g, 1, "Anvl", NULL, &c_strs, &c);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: config %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+	ret = usbg_add_config_function(c, "acm.GS0", f_acm0);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: acm.GS0 %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+	ret = usbg_add_config_function(c, "ecm.usb0", f_ecm);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: ecm.usb0 %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+	ret = usbg_enable_gadget(g, DEFAULT_UDC);
+	if (ret != USBG_SUCCESS) {
+		fprintf(stderr, "ERROR: enable %s: %s\n", usbg_error_name(ret),
+				usbg_strerror(ret));
+		goto out;
+	}
+
+out:
+	usbg_cleanup(s);
+
+	return ret;
+}
+
+
 /*
  * Depends on /etc/systemd/system/anvl-getty-usb@.service
  * having something like this:
@@ -430,6 +568,7 @@ void signal_handler(int signal)
 {
 	configure_charger(0);
 	configure_usb_console(0);
+	configure_usb_gadget(0);
 	exit(0);
 }
 
@@ -475,6 +614,11 @@ int main(int argc, char **argv)
 			ret = configure_charger(status);
 			if (ret)
 				return ret;
+		}
+
+		if (status_changed) {
+			ret = configure_usb_gadget(status & VBUS);
+			/* Ignore errors in case it was manually configured */
 		}
 
 		if (status_changed) {

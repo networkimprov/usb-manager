@@ -302,7 +302,8 @@ static int configure_charger(unsigned int status)
 			dumb_charger_retries++;
 
 			/* Workaround for dumb charger with d+ and d- shorted */
-			if ((dumb_charger_retries > 2) && b_idle && (f_iinlim) == 0) {
+			if ((dumb_charger_retries > 2) && (b_idle || enumerated) &&
+			    (f_iinlim) == 0) {
 				res = force_charger_current(5,
 					"1500mA, dumb charger?");
 				if (res < 0)

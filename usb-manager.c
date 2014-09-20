@@ -282,7 +282,7 @@ static int configure_charger(unsigned int status)
 		int f_iinlim, f_vbus_stat;
 		unsigned int current;
 		char buf[BUF_SZ];
-		char *charger_desc;
+		char *charger_desc = NULL;
 
 		res = read_sysfs_entry(file_f_iinlim, buf);
 		if (res < 1)
@@ -559,13 +559,13 @@ static int configure_usb_console(int connected)
 		exit(res);
 	} else {
 		/* Parent */
-		wait(&res);
+		waitpid(-1, &res, 0);
 	}
 
 	return 0;
 }
 
-void signal_handler(int signal)
+static void signal_handler(int signal)
 {
 	configure_charger(0);
 	configure_usb_console(0);
@@ -580,7 +580,7 @@ int main(int argc, char **argv)
 	int ret, status_changed, recheck = 0, timeout_ms = 1;
 	sigset_t mask;
 	struct sigaction act;
-	unsigned int status;
+	unsigned int status = 0;
 
 	if (argc > 1) {
 		if (!strcmp(argv[1], "--help")) {
@@ -598,7 +598,7 @@ int main(int argc, char **argv)
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = signal_handler;
 
-	ret = sigaction(SIGINT, &act, 0);
+	ret = sigaction(SIGINT, &act, NULL);
 	if (ret)
 		return ret;
 

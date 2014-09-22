@@ -545,8 +545,8 @@ static int configure_usb_console(int connected)
 
 	res = stat(args[0], &buf);
 	if (res) {
-		fprintf(stderr, "ERROR: Could not find %s\n", args[0]);
-		return res;
+		fprintf(stderr, "WARNING: Could not find %s\n", args[0]);
+		return 0;
 	}
 
 	pid = fork();

@@ -23,6 +23,7 @@
 
 struct files {
 	char *desc;
+	char *find_arg;
 	char *file;
 	char *match;
 	unsigned int mask;
@@ -31,15 +32,15 @@ struct files {
 
 static struct files sysfs[] = {
 	{ .desc = "twl_vbus",
-	  .file = "/sys/bus/platform/devices/48070000.i2c:twl@48:twl4030-usb/vbus",
+	  .find_arg = "*twl4030-usb/vbus",
 	  .match = "on", .mask = VBUS, },
 	{ .desc = "musb_vbus",
-	  .file = "/sys/bus/platform/devices/musb-hdrc.0.auto/vbus", },
+	  .find_arg = "*musb-hdrc.0.auto/vbus", },
 	{ .desc = "musb_mode",
-	  .file = "/sys/bus/platform/devices/musb-hdrc.0.auto/mode",
+	  .find_arg = "*musb-hdrc.0.auto/mode",
 	  .match = "b_idle", .mask = B_IDLE, },
 	{ .desc = "bq_status",
-	  .file = "/sys/class/power_supply/bq24190-battery/status",
+	  .find_arg = "*bq24190-battery/status",
 	  .match = "Charging", .mask = CHARGING, },
 	{ /* Sentinel */ },
 };
@@ -68,6 +69,88 @@ static int parse_sysfs(struct files *f, char *val, unsigned int *status)
 			*status |= B_PERIPHERAL;
 		else
 			*status &= ~B_PERIPHERAL;
+	}
+
+	return 0;
+}
+
+static int find_sysfs_entry(struct files *f)
+{
+	char *args[4];
+	int res, pid, child_status, link[2];
+
+	args[0] = "find";
+	args[1] = "/sys/devices";
+	args[2] = "-wholename";
+	args[3] = f->find_arg;
+	args[4] = NULL;
+
+	f->file = malloc(BUF_SZ);
+	if (!f->file)
+		return -ENOMEM;
+	memset(f->file, 0, BUF_SZ);
+
+	res = pipe(link);
+	if (res)
+		goto free;
+
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "ERROR: Could not fork\n");
+	} else if (pid == 0) {
+		dup2 (link[1], STDOUT_FILENO);
+		close(link[0]);
+		close(link[1]);
+		res = execvp(args[0], args);
+		if (res) {
+			fprintf(stderr, "ERROR: Finding sysfs %s failed with %i\n",
+				f->find_arg, res);
+			return res;
+                }
+		exit(0);
+	} else {
+		pid_t tpid;
+
+		do {
+			tpid = wait(&child_status);
+			if (tpid != pid) {
+				fprintf(stderr, "ERROR: Child terminated\n");
+				goto free;
+			}
+		} while (tpid != pid);
+
+		close(link[1]);
+		res = read(link[0], f->file, BUF_SZ);
+		if (res < 0) {
+			fprintf(stderr, "ERROR: Could not get sysfs %s: %i\n",
+				f->find_arg, res);
+			goto free;
+		}
+		f->file[res - 1] = '\0';
+		if (debug)
+			fprintf(stderr, "Got sysfs file %s\n", f->file);
+		res = strncmp(args[1], f->file, strlen(args[1]));
+		if (res)
+			goto free;
+        }
+
+        return child_status;
+
+free:
+	free(f->file);
+
+	return res;
+}
+
+static int find_sysfs_entries(struct files *f)
+{
+	int ret;
+
+	while (f->find_arg != NULL) {
+		ret = find_sysfs_entry(f);
+		if (ret)
+			return ret;
+		f++;
 	}
 
 	return 0;
@@ -567,9 +650,17 @@ static int configure_usb_console(int connected)
 
 static void signal_handler(int signal)
 {
+	struct files *f = sysfs;
+
 	configure_charger(0);
 	configure_usb_console(0);
 	configure_usb_gadget(0);
+
+	while (f->find_arg != NULL) {
+		free(f->file);
+		f++;
+	}
+
 	exit(0);
 }
 
@@ -594,6 +685,10 @@ int main(int argc, char **argv)
 			return -EINVAL;
 		}
 	}
+
+	ret = find_sysfs_entries(sysfs);
+	if (ret)
+		return ret;
 
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = signal_handler;

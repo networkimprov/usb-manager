@@ -473,7 +473,12 @@ static int configure_usb_gadget(int connected)
 	int ret;
 
 	/* We need minimum 700ms sleep for bq24190 charger detection */
-	sleep(1);
+	if (connected) {
+		if (debug)
+			fprintf(stderr,
+				"Delaying enumeration for charger detect...\n");
+		sleep(1);
+	}
 
 	usbg_gadget_attrs g_attrs = {
 			0x0200,			/* bcdUSB */

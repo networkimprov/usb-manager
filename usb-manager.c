@@ -106,8 +106,7 @@ static int parse_sysfs_gpio(struct files *f)
 		res = -ENODEV;
 	}
 	if (debug)
-		fprintf(stderr, "GPIO for %s: %i\n",
-			f->find_arg, f->gpio);
+		printf("GPIO for %s: %i\n", f->find_arg, f->gpio);
 free:
 	close(fd);
 
@@ -130,9 +129,9 @@ static int set_gpio(int gpio, int value)
 		sprintf(cmd, "echo %i > /sys/class/gpio/export", gpio);
 		res = system(cmd);
 		if (res) {
-			fprintf(stderr, "ERROR: failed to init GPIO: %i\n",
+			fprintf(stderr, "WARNING: GPIO handled by kernel?: %i\n",
 				res);
-			return res;
+			return 0;
 		}
 	}
 
@@ -219,7 +218,7 @@ static int find_sysfs_entry(struct files *f)
 		}
 
 		if (debug)
-			fprintf(stderr, "Got sysfs file %s\n", f->file);
+			printf("Got sysfs file %s\n", f->file);
 		res = strncmp(args[1], f->file, strlen(args[1]));
 		if (res) {
 			fprintf(stderr, "ERROR: Bad syfs file: \"%s\"\n", f->file);
@@ -410,7 +409,7 @@ static int configure_charger_led(int value)
 	const char *name =
 		"/sys/class/leds/pca963x:blue/brightness";
 	sprintf(val, "%i\n", value);
-	len = write_sysfs_entry(name, val, strlen(val)); 
+	len = write_sysfs_entry(name, val, strlen(val));
 	if (len < 0)
 		return len;
 
@@ -431,6 +430,17 @@ static const unsigned int charger_current[MAX_CURRENT] = {
 	3000,
 };
 
+enum charger_current_val {
+	BQ24190_MAX_100MA = 0,
+	BQ24190_MAX_150MA,
+	BQ24190_MAX_500MA,
+	BQ24190_MAX_900MA,
+	BQ24190_MAX_1200MA,
+	BQ24190_MAX_1500MA,
+	BQ24190_MAX_2000MA,
+	BQ24190_MAX_3000MA,
+};
+
 /* Charger type detected by bq24190 */
 enum charger_type {
 	CHARGER_UNKNOWN = 0,
@@ -439,20 +449,38 @@ enum charger_type {
 	CHARGER_OTG,
 };
 
-static int force_charger_current(int val, const char *desc)
+static int to_max_current(enum charger_type max_current)
+{
+	return charger_current[max_current];
+}
+
+static int force_charger_current(int val, int gpio, const char *desc)
 {
 	const char *file_f_iinlim =
 		"/sys/class/power_supply/bq24190-charger/f_iinlim";
 	char buf[8];
 	int res;
 
-	if (val > 7)
-		val = 7;
+	if (val > BQ24190_MAX_3000MA)
+		val = BQ24190_MAX_3000MA;
+
+	if (gpio) {
+		int gpio_val;
+
+		if (val > BQ24190_MAX_500MA)
+			gpio_val = 1;
+		else
+			gpio_val = 0;
+
+		res = set_gpio(gpio, gpio_val);
+		if (res)
+			return res;
+	}
 
 	sprintf(buf, "%i\n", val);
 	if (desc)
-		fprintf(stderr, "WARNING: Forcing charger current, %s\n",
-			desc);
+		fprintf(stderr, "WARNING: Forcing charger current to %imA, %s\n",
+			charger_current[val], desc);
 	res = write_sysfs_entry(file_f_iinlim, buf, 2);
 	if (res < 0)
 		return -EINVAL;
@@ -462,9 +490,12 @@ static int force_charger_current(int val, const char *desc)
 
 static int dumb_charger_retries;
 
-static int configure_charger(unsigned int status)
+static int configure_charger(unsigned int status, int gpio,
+	enum charger_current_val *max_current)
 {
 	int res, b_idle, enumerated, charging;
+
+	*max_current = BQ24190_MAX_100MA;
 
 	if (!status)
 		goto out;
@@ -506,8 +537,9 @@ static int configure_charger(unsigned int status)
 			/* Workaround for dumb charger with d+ and d- shorted */
 			if ((dumb_charger_retries > 2) && (b_idle || enumerated) &&
 			    (f_iinlim) == 0) {
-				res = force_charger_current(5,
-					"1500mA, dumb charger?");
+				*max_current = BQ24190_MAX_1500MA;
+				res = force_charger_current(*max_current,
+					gpio, "dumb charger?");
 				if (res < 0)
 					return -EINVAL;
 				f_iinlim = 5;
@@ -519,14 +551,16 @@ static int configure_charger(unsigned int status)
 
 			/* Workaround for bq24190 OTG pin being high */
 			if (b_idle && (f_iinlim > 0)) {
-				res = force_charger_current(0,
-					"100mA, OTG pin high?");
+				*max_current = BQ24190_MAX_100MA; 
+				res = force_charger_current(*max_current,
+					gpio, "OTG pin high?");
 				if (res < 0)
 					return -EINVAL;
 				f_iinlim = 0;
 			} else if (enumerated && (f_iinlim == 0)) {
-				res = force_charger_current(2,
-					"500mA, configured while charging?");
+				*max_current = BQ24190_MAX_100MA; 
+				res = force_charger_current(*max_current,
+					gpio, "configured while charging?");
 				if (res < 0)
 					return -EINVAL;
 				f_iinlim = 2;
@@ -567,7 +601,7 @@ static int configure_charger(unsigned int status)
 out:
 	dumb_charger_retries = 0;
 	configure_charger_led(0);
-	res = force_charger_current(0, NULL);
+	res = force_charger_current(*max_current, gpio, NULL);
 	if (res < 0)
 		return -EINVAL;
 
@@ -583,7 +617,7 @@ out:
  * Based on the libusbg example at:
  * https://github.com/libusbg/libusbg/blob/master/examples/gadget-acm-ecm.c
  */
-static int configure_usb_gadget(int connected)
+static int configure_usb_gadget(int connected, int max_current)
 {
 	usbg_state *s;
 	usbg_gadget *g;
@@ -594,8 +628,7 @@ static int configure_usb_gadget(int connected)
 	/* We need minimum 700ms sleep for bq24190 charger detection */
 	if (connected) {
 		if (debug)
-			fprintf(stderr,
-				"Delaying enumeration for charger detect...\n");
+			printf("Delaying enumeration for charger detect...\n");
 		sleep(1);
 	}
 
@@ -620,6 +653,11 @@ static int configure_usb_gadget(int connected)
 			"CDC ACM+ECM"
 	};
 
+	usbg_config_attrs c_attrs = {
+		0x40,
+		250,
+	};
+
 	ret = usbg_init("/sys/kernel/config", &s);
 	if (ret != USBG_SUCCESS) {
 		fprintf(stderr, "ERROR: init %s :%s\n", usbg_error_name(ret),
@@ -635,6 +673,7 @@ static int configure_usb_gadget(int connected)
 		if (connected) {
 			char buf[UDC_SZ];
 			ssize_t len;
+			usbg_config *cc;
 
 			len = usbg_get_gadget_udc_len(g);
 			if (len < 0)
@@ -644,6 +683,16 @@ static int configure_usb_gadget(int connected)
 				goto out;
 			if (!strcmp(UDC, buf))
 				goto out;
+			cc = usbg_get_config(g, 1, NULL);
+			if (cc) {
+				ret = usbg_set_config_max_power(cc,
+					to_max_current(max_current) / 2);
+				if (ret)
+					goto out;
+				if (debug)
+					printf("Set USB gadget to %imW\n",
+						to_max_current(max_current));
+			}
 			if (debug)
 				printf("Enabling USB gadget\n");
 			ret = usbg_enable_gadget(g, "musb-hdrc.0.auto");
@@ -680,8 +729,7 @@ static int configure_usb_gadget(int connected)
 		goto out;
 	}
 
-	/* NULL can be passed to use kernel defaults */
-	ret = usbg_create_config(g, 1, "Anvl", NULL, &c_strs, &c);
+	ret = usbg_create_config(g, 1, "Anvl", &c_attrs, &c_strs, &c);
 	if (ret != USBG_SUCCESS) {
 		fprintf(stderr, "ERROR: config %s: %s\n", usbg_error_name(ret),
 				usbg_strerror(ret));
@@ -774,9 +822,11 @@ static int configure_usb_console(int connected)
 
 static void signal_handler(int signal)
 {
-	configure_charger(0);
+	enum charger_current_val max_current;
+
+	configure_charger(0, gpio, &max_current);
 	configure_usb_console(0);
-	configure_usb_gadget(0);
+	configure_usb_gadget(0, BQ24190_MAX_100MA);
 	free_sysfs_entries(sysfs);
 
 	exit(0);
@@ -811,7 +861,7 @@ int main(int argc, char **argv)
 	if (gpio) {
 		ret = set_gpio(gpio, 0);
 		if (ret)
-			goto free;
+			gpio = 0;
 	}
 
 	memset(&act, 0, sizeof(act));
@@ -826,18 +876,20 @@ int main(int argc, char **argv)
 
 	/* Keep checking when state changes */
 	while (1) {
+		enum charger_current_val max_current;
+
 		ret = poll_vbus(sysfs, timeout_ms, mask, &status_changed, &status);
 		if (ret)
 			goto free;
 
 		if (status_changed || recheck)  {
-			ret = configure_charger(status);
+			ret = configure_charger(status, gpio, &max_current);
 			if (ret)
 				goto free;
 		}
 
 		if (status_changed) {
-			ret = configure_usb_gadget(status & VBUS);
+			ret = configure_usb_gadget(status & VBUS, max_current);
 			/* Ignore errors in case it was manually configured */
 		}
 

@@ -27,6 +27,8 @@ struct files {
 	char *file;
 	char *match;
 	unsigned int mask;
+	int gpio_base;		/* offset from the gpio_chip */
+	int gpio;
 	struct pollfd *pfd;
 };
 
@@ -42,10 +44,14 @@ static struct files sysfs[] = {
 	{ .desc = "bq_status",
 	  .find_arg = "*bq24190-battery/status",
 	  .match = "Charging", .mask = CHARGING, },
+	{ .desc = "bq_otg_id",
+	  .find_arg = "*twl4030-gpio/gpio/gpiochip*/base",
+	  .gpio_base = 6, },
 	{ /* Sentinel */ },
 };
 
 static int debug;
+static int gpio;
 
 /*
  * Sets things based on sysfs vbus state as otherwise running
@@ -69,6 +75,82 @@ static int parse_sysfs(struct files *f, char *val, unsigned int *status)
 			*status |= B_PERIPHERAL;
 		else
 			*status &= ~B_PERIPHERAL;
+	}
+
+	return 0;
+}
+
+static int parse_sysfs_gpio(struct files *f)
+{
+	int fd, res;
+	ssize_t len;
+	char buf[BUF_SZ];
+
+	fd = open(f->file, O_RDONLY);
+	if (fd < 1)
+		return -ENOENT;
+
+	len = read(fd, buf, BUF_SZ);
+	if (len < 1) {
+		res = -EIO;
+		goto free;
+
+	}
+	f->gpio = strtoul(buf, NULL, 10);
+	if (f->gpio > 0) {
+		f->gpio += f->gpio_base;
+		gpio = f->gpio;
+		res = 0;
+	} else {
+		f->gpio = 0;
+		res = -ENODEV;
+	}
+	if (debug)
+		fprintf(stderr, "GPIO for %s: %i\n",
+			f->find_arg, f->gpio);
+free:
+	close(fd);
+
+	return res;
+}
+
+static int set_gpio(int gpio, int value)
+{
+	char buf[BUF_SZ], cmd[BUF_SZ];
+	struct stat s;
+	int res;
+
+	sprintf(buf, "/sys/class/gpio/gpio%i", gpio);
+	res = stat(buf, &s);
+	if (res == 0) {
+		if ((s.st_mode & S_IFDIR) != S_IFDIR)
+			return -ENOENT;
+	} else {
+
+		sprintf(cmd, "echo %i > /sys/class/gpio/export", gpio);
+		res = system(cmd);
+		if (res) {
+			fprintf(stderr, "ERROR: failed to init GPIO: %i\n",
+				res);
+			return res;
+		}
+	}
+
+	sprintf(cmd, "echo out  > /sys/class/gpio/gpio%i/direction", gpio);
+	res = system(cmd);
+	if (res) {
+		fprintf(stderr, "ERROR: GPIO direction: %i\n",
+			res);
+		return res;
+	}
+
+	sprintf(cmd, "echo %i  > /sys/class/gpio/gpio%i/value",
+		value, gpio);
+	res = system(cmd);
+	if (res) {
+		fprintf(stderr, "ERROR: GPIO value: %i\n",
+			res);
+		return res;
 	}
 
 	return 0;
@@ -143,6 +225,14 @@ static int find_sysfs_entry(struct files *f)
 			fprintf(stderr, "ERROR: Bad syfs file: \"%s\"\n", f->file);
 			res = -ENOENT;
 			goto free;
+		}
+
+		if (f->gpio_base) {
+			res = parse_sysfs_gpio(f);
+			if (res) {
+				fprintf(stderr, "WARNING: No GPIO %s\n",
+					f->file);
+			}
 		}
         }
 
@@ -718,12 +808,18 @@ int main(int argc, char **argv)
 	if (ret)
 		return ret;
 
+	if (gpio) {
+		ret = set_gpio(gpio, 0);
+		if (ret)
+			goto free;
+	}
+
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = signal_handler;
 
 	ret = sigaction(SIGINT, &act, NULL);
 	if (ret)
-		return ret;
+		goto free;
 
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
@@ -732,12 +828,12 @@ int main(int argc, char **argv)
 	while (1) {
 		ret = poll_vbus(sysfs, timeout_ms, mask, &status_changed, &status);
 		if (ret)
-			return ret;
+			goto free;
 
 		if (status_changed || recheck)  {
 			ret = configure_charger(status);
 			if (ret)
-				return ret;
+				goto free;
 		}
 
 		if (status_changed) {
@@ -748,7 +844,7 @@ int main(int argc, char **argv)
 		if (status_changed) {
 			ret = configure_usb_console(status & B_PERIPHERAL);
 			if (ret)
-				return ret;
+				goto free;
 		}
 
 		if (ret != 0) {
@@ -767,6 +863,8 @@ int main(int argc, char **argv)
 			recheck = 0;
 		}
 	}
+free:
+	free_sysfs_entries(sysfs);
 
 	return ret;
 }

@@ -115,6 +115,7 @@ static int find_sysfs_entry(struct files *f)
 			tpid = wait(&child_status);
 			if (tpid != pid) {
 				fprintf(stderr, "ERROR: Child terminated\n");
+				res = -ENXIO;
 				goto free;
 			}
 		} while (tpid != pid);
@@ -124,22 +125,45 @@ static int find_sysfs_entry(struct files *f)
 		if (res < 0) {
 			fprintf(stderr, "ERROR: Could not get sysfs %s: %i\n",
 				f->find_arg, res);
+			res = -ENOENT;
 			goto free;
 		}
 		f->file[res - 1] = '\0';
+		if (strlen(f->file) < strlen(f->find_arg)) {
+			fprintf(stderr, "ERROR: No sysfs file matching %s\n",
+				f->find_arg);
+			res = -ENOENT;
+			goto free;
+		}
+
 		if (debug)
 			fprintf(stderr, "Got sysfs file %s\n", f->file);
 		res = strncmp(args[1], f->file, strlen(args[1]));
-		if (res)
+		if (res) {
+			fprintf(stderr, "ERROR: Bad syfs file: \"%s\"\n", f->file);
+			res = -ENOENT;
 			goto free;
+		}
         }
 
-        return child_status;
+        return res;
 
 free:
 	free(f->file);
+	f->file = NULL;
 
 	return res;
+}
+
+static void free_sysfs_entries(struct files *f)
+{
+	while (f->find_arg != NULL) {
+		if (f->file) {
+			free(f->file);
+			f->file = NULL;
+		}
+		f++;
+	}
 }
 
 static int find_sysfs_entries(struct files *f)
@@ -149,11 +173,16 @@ static int find_sysfs_entries(struct files *f)
 	while (f->find_arg != NULL) {
 		ret = find_sysfs_entry(f);
 		if (ret)
-			return ret;
+			goto free;
 		f++;
 	}
 
 	return 0;
+
+free:
+	free_sysfs_entries(f);
+
+	return ret;
 }
 
 static int poll_vbus(struct files *sysfs, int timeout_msecs, sigset_t mask,
@@ -655,16 +684,10 @@ static int configure_usb_console(int connected)
 
 static void signal_handler(int signal)
 {
-	struct files *f = sysfs;
-
 	configure_charger(0);
 	configure_usb_console(0);
 	configure_usb_gadget(0);
-
-	while (f->find_arg != NULL) {
-		free(f->file);
-		f++;
-	}
+	free_sysfs_entries(sysfs);
 
 	exit(0);
 }

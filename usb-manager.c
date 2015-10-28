@@ -504,6 +504,16 @@ static int configure_charger(unsigned int status, int gpio,
 	enumerated = ((status & (B_PERIPHERAL | VBUS)) == (B_PERIPHERAL | VBUS));
 	charging = (status & CHARGING);
 
+	/* We need minimum 700ms sleep for bq24190 charger detection */
+	if ((status & VBUS) && !enumerated) {
+		if (debug)
+			printf("Delaying enumeration for charger detect...\n");
+		sleep(1);
+		res = force_charger_current(BQ24190_MAX_100MA, gpio, NULL);
+		if (res < 0)
+			return -EINVAL;
+	}
+
 	if (b_idle || enumerated || charging) {
 		const char *file_f_iinlim =
 			"/sys/class/power_supply/bq24190-charger/f_iinlim";
@@ -513,7 +523,6 @@ static int configure_charger(unsigned int status, int gpio,
 			"/sys/class/power_supply/bq24190-battery/status";
 
 		int f_iinlim, f_vbus_stat;
-		unsigned int current;
 		char buf[BUF_SZ];
 		char *charger_desc = NULL;
 
@@ -533,16 +542,15 @@ static int configure_charger(unsigned int status, int gpio,
 		case CHARGER_UNKNOWN:
 			charger_desc = "unkown";
 			dumb_charger_retries++;
+			*max_current = BQ24190_MAX_1500MA;
 
 			/* Workaround for dumb charger with d+ and d- shorted */
 			if ((dumb_charger_retries > 2) && (b_idle || enumerated) &&
 			    (f_iinlim) == 0) {
-				*max_current = BQ24190_MAX_1500MA;
 				res = force_charger_current(*max_current,
 					gpio, "dumb charger?");
 				if (res < 0)
 					return -EINVAL;
-				f_iinlim = 5;
 			}
 			break;
 		case CHARGER_USBHOST:
@@ -556,19 +564,24 @@ static int configure_charger(unsigned int status, int gpio,
 					gpio, "OTG pin high?");
 				if (res < 0)
 					return -EINVAL;
-				f_iinlim = 0;
-			} else if (enumerated && (f_iinlim == 0)) {
-				*max_current = BQ24190_MAX_100MA; 
+			} else if (enumerated) {
+				*max_current = BQ24190_MAX_500MA; 
 				res = force_charger_current(*max_current,
-					gpio, "configured while charging?");
+					gpio, NULL);
 				if (res < 0)
 					return -EINVAL;
-				f_iinlim = 2;
 			}
 			break;
 		case CHARGER_ADAPTER:
 			charger_desc = "adapter port";
 			dumb_charger_retries = 0;
+			*max_current = BQ24190_MAX_1500MA;
+			if (enumerated) {
+				res = force_charger_current(*max_current,
+					gpio, NULL);
+				if (res < 0)
+					return -EINVAL;
+			}
 			break;
 		case CHARGER_OTG:
 			charger_desc = "OTG";
@@ -583,12 +596,11 @@ static int configure_charger(unsigned int status, int gpio,
 		if (res < 1)
 			return -EINVAL;
 
-		current = charger_current[f_iinlim];
-
 		if (debug)
-			printf("%s %s %s charger %umA iinlim: %i vbus: %i\n",
+			printf("%s %s %s charger %umA vbus: %i\n",
 			       buf, enumerated ? "enumerated" : "b_idle",
-			       charger_desc, current, f_iinlim, f_vbus_stat);
+			       charger_desc, to_max_current(*max_current),
+			       f_vbus_stat);
 
 		if (!strcmp("Full", buf))
 			configure_charger_led(0);
@@ -624,13 +636,6 @@ static int configure_usb_gadget(int connected, int max_current)
 	usbg_config *c;
 	usbg_function *f_acm0, *f_ecm;
 	int ret;
-
-	/* We need minimum 700ms sleep for bq24190 charger detection */
-	if (connected) {
-		if (debug)
-			printf("Delaying enumeration for charger detect...\n");
-		sleep(1);
-	}
 
 	usbg_gadget_attrs g_attrs = {
 			0x0200,			/* bcdUSB */
@@ -681,17 +686,19 @@ static int configure_usb_gadget(int connected, int max_current)
 			ret = usbg_get_gadget_udc(g, buf, len);
 			if (ret < 0)
 				goto out;
-			if (!strcmp(UDC, buf))
+			if (!strncmp(UDC, buf, strlen(UDC)))
 				goto out;
 			cc = usbg_get_config(g, 1, NULL);
 			if (cc) {
-				ret = usbg_set_config_max_power(cc,
-					to_max_current(max_current) / 2);
+				int max = to_max_current(max_current);
+
+				if (max == 100)
+					max = 500;
+				ret = usbg_set_config_max_power(cc, max / 2);
 				if (ret)
 					goto out;
 				if (debug)
-					printf("Set USB gadget to %imW\n",
-						to_max_current(max_current));
+					printf("Set USB gadget to %imW\n", max);
 			}
 			if (debug)
 				printf("Enabling USB gadget\n");

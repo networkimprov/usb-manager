@@ -509,9 +509,6 @@ static int configure_charger(unsigned int status, int gpio,
 		if (debug)
 			printf("Delaying enumeration for charger detect...\n");
 		sleep(1);
-		res = force_charger_current(BQ24190_MAX_100MA, gpio, NULL);
-		if (res < 0)
-			return -EINVAL;
 	}
 
 	if (b_idle || enumerated || charging) {
@@ -870,6 +867,16 @@ int main(int argc, char **argv)
 		if (ret)
 			gpio = 0;
 	}
+
+	/* Set max 100mA and clear GPIO */
+	ret = force_charger_current(BQ24190_MAX_100MA, gpio, NULL);
+	if (ret)
+		goto free;
+
+	/* Set max 1500mA and don't set GPIO */
+	ret = force_charger_current(BQ24190_MAX_1500MA, 0, NULL);
+	if (ret)
+		goto free;
 
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = signal_handler;

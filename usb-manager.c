@@ -659,7 +659,7 @@ static int configure_usb_gadget(int connected, int max_current)
 	};
 
 	usbg_config_attrs c_attrs = {
-		0x40,
+		0x80,
 		250,
 	};
 

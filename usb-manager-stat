@@ -1,0 +1,21 @@
+#!/bin/bash
+
+charger=$(find /sys/devices -type d -name bq24190-charger)
+battery=$(find /sys/devices -type d -name bq24190-battery)
+bq24190_gpio=/sys/class/gpio/gpio500/value
+usb_gadget=/sys/kernel/config/usb_gadget/g1/UDC
+
+echo "charger at $charger"
+echo "battery at $battery"
+echo "gpio at $bq24190_gpio"
+echo "gadget at $usb_gadget"
+
+while [ 1 ]; do
+        f_iinlim=$(cat $charger/f_iinlim)
+        en_hiz=$(cat $charger/f_en_hiz)
+        status=$(cat $battery/status)
+        gpio=$(cat $bq24190_gpio)
+        gadget=$(cat $usb_gadget)
+        echo "iinlim: $f_iinlim en_hiz: $en_hiz gpio: $gpio battery: $status gadget: $gadget"
+        sleep 1
+done

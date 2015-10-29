@@ -402,17 +402,48 @@ static int write_sysfs_entry(const char *file, const char *val, size_t count)
 	return len;
 }
 
-
-static int configure_charger_led(int value)
+static int write_sysfs_value(const char *file, int value)
 {
 	char val[32];
 	ssize_t len;
-	const char *name =
-		"/sys/class/leds/pca963x:blue/brightness";
+
 	sprintf(val, "%i\n", value);
-	len = write_sysfs_entry(name, val, strlen(val));
+	len = write_sysfs_entry(file, val, strlen(val));
 	if (len < 0)
 		return len;
+
+	return 0;
+}
+
+static int configure_charger_led(int value, int full)
+{
+	const char *red =
+		"/sys/class/leds/pca963x:green/brightness";
+	const char *green =
+		"/sys/class/leds/pca963x:green/brightness";
+	const char *blue =
+		"/sys/class/leds/pca963x:blue/brightness";
+	const char const *colors[3] = { red, green, blue, };
+	const char *color;
+	int res, i;
+
+	if (full)
+		color = green;
+	else
+		color = blue;
+
+	res = write_sysfs_value(color, value);
+	if (res)
+		return res;
+
+	for (i = 0; i < sizeof(colors); i++) {
+		if (color == colors[i])
+			continue;
+
+		res = write_sysfs_value(colors[i], 0);
+		if (res)
+			return res;
+	}
 
 	return 0;
 }
@@ -623,17 +654,17 @@ static int configure_charger(unsigned int status, int gpio,
 			       f_vbus_stat);
 
 		if (!strcmp("Full", buf)) {
-			configure_charger_led(0);
+			configure_charger_led(255, 1);
 		} else if (!strcmp("Not charging", buf) ||
 				!strcmp("Discharging", buf)) {
-			configure_charger_led(0);
+			configure_charger_led(0, 0);
 			res = set_charger_defaults(gpio);
 			if (res)
 				return res;
 			else
 				return -EAGAIN;
 		} else {
-			configure_charger_led(1 + (32 * f_iinlim));
+			configure_charger_led(1 + (32 * f_iinlim), 0);
 		}
 
 		return 0;
@@ -641,7 +672,7 @@ static int configure_charger(unsigned int status, int gpio,
 
 out:
 	dumb_charger_retries = 0;
-	configure_charger_led(0);
+	configure_charger_led(0, 0);
 	res = force_charger_current(*max_current, gpio, NULL);
 	if (res < 0)
 		return -EINVAL;

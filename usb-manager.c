@@ -12,6 +12,7 @@
 
 #define BUF_SZ		1024
 
+#define CHARGER_FAILED	(1 << 6)
 #define F_IINLIM_PC	(1 << 5)
 #define F_VBUS_STAT_PC	(1 << 4)
 #define CHARGING	(1 << 3)
@@ -458,6 +459,8 @@ static int force_charger_current(int val, int gpio, const char *desc)
 {
 	const char *file_f_iinlim =
 		"/sys/class/power_supply/bq24190-charger/f_iinlim";
+	const char *file_f_en_hiz =
+		"/sys/class/power_supply/bq24190-charger/f_en_hiz";
 	char buf[8];
 	int res;
 
@@ -484,6 +487,26 @@ static int force_charger_current(int val, int gpio, const char *desc)
 	res = write_sysfs_entry(file_f_iinlim, buf, 2);
 	if (res < 0)
 		return -EINVAL;
+	sprintf(buf, "%i\n", 0);
+	res = write_sysfs_entry(file_f_en_hiz, buf, 2);
+	if (res < 0)
+		return -EINVAL;
+
+	return 0;
+}
+
+/* By defauilt, set max 1500mA and GPIO down */
+static int set_charger_defaults(int gpio)
+{
+	int res;
+
+	res = force_charger_current(BQ24190_MAX_100MA, gpio, NULL);
+	if (res)
+		return res;
+
+	res = force_charger_current(BQ24190_MAX_1500MA, 0, NULL);
+	if (res)
+		return res;
 
 	return 0;
 }
@@ -599,10 +622,19 @@ static int configure_charger(unsigned int status, int gpio,
 			       charger_desc, to_max_current(*max_current),
 			       f_vbus_stat);
 
-		if (!strcmp("Full", buf))
+		if (!strcmp("Full", buf)) {
 			configure_charger_led(0);
-		else
+		} else if (!strcmp("Not charging", buf) ||
+				!strcmp("Discharging", buf)) {
+			configure_charger_led(0);
+			res = set_charger_defaults(gpio);
+			if (res)
+				return res;
+			else
+				return -EAGAIN;
+		} else {
 			configure_charger_led(1 + (32 * f_iinlim));
+		}
 
 		return 0;
 	}
@@ -868,13 +900,7 @@ int main(int argc, char **argv)
 			gpio = 0;
 	}
 
-	/* Set max 100mA and clear GPIO */
-	ret = force_charger_current(BQ24190_MAX_100MA, gpio, NULL);
-	if (ret)
-		goto free;
-
-	/* Set max 1500mA and don't set GPIO */
-	ret = force_charger_current(BQ24190_MAX_1500MA, 0, NULL);
+	ret = set_charger_defaults(gpio);
 	if (ret)
 		goto free;
 
@@ -898,8 +924,12 @@ int main(int argc, char **argv)
 
 		if (status_changed || recheck)  {
 			ret = configure_charger(status, gpio, &max_current);
-			if (ret)
+			if (ret == -EAGAIN) {
+				status = CHARGER_FAILED;
+				status_changed = 1;
+			} else if (ret) {
 				goto free;
+			}
 		}
 
 		if (status_changed) {
@@ -921,7 +951,8 @@ int main(int argc, char **argv)
 		if (status & CHARGING) {
 			timeout_ms = 5000;
 			recheck = 1;
-		} else if (B_IDLE_VBUS(status) || (status & B_PERIPHERAL)) {
+		} else if (B_IDLE_VBUS(status) || (status & B_PERIPHERAL) ||
+				(status & CHARGER_FAILED)) {
 			timeout_ms = 1000;
 			recheck = 1;
 		} else {

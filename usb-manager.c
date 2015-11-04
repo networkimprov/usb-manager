@@ -12,9 +12,6 @@
 
 #define BUF_SZ		1024
 
-#define CHARGER_FAILED	(1 << 6)
-#define F_IINLIM_PC	(1 << 5)
-#define F_VBUS_STAT_PC	(1 << 4)
 #define CHARGING	(1 << 3)
 #define B_PERIPHERAL	(1 << 2)
 #define B_IDLE		(1 << 1)
@@ -110,6 +107,23 @@ static int parse_sysfs_gpio(struct files *f)
 		printf("GPIO for %s: %i\n", f->find_arg, f->gpio);
 free:
 	close(fd);
+
+	return res;
+}
+
+static int read_sysfs_entry(const char *file, char *buf);
+
+static int get_gpio(int gpio)
+{
+	char sys_gpio[BUF_SZ];
+	char buf[BUF_SZ];
+	int res = -EINVAL;
+
+	sprintf(sys_gpio, "/sys/class/gpio/gpio%i/value", gpio);
+	res = read_sysfs_entry(sys_gpio, buf);
+	if (res < 1)
+		return res;
+	res = atoi(buf);
 
 	return res;
 }
@@ -481,201 +495,105 @@ enum charger_type {
 	CHARGER_OTG,
 };
 
+enum charge_status {
+	CHARGE_STATUS_UNKNOWN = 0,
+	CHARGE_STATUS_CHARGING,
+	CHARGE_STATUS_DISCHARGING,
+	CHARGE_STATUS_NOT_CHARGING,
+	CHARGE_STATUS_FULL,
+};
+
+struct charger_status {
+	enum charger_type type;
+	enum charger_current_val current;
+	enum charge_status status;
+	int gpio;
+};
+
 static int to_max_current(enum charger_type max_current)
 {
 	return charger_current[max_current];
 }
 
-static int force_charger_current(int val, int gpio, const char *desc)
+/* By default, just set GPIO down */
+static int set_charger(int max_current, int gpio, int value)
 {
-	const char *file_f_iinlim =
-		"/sys/class/power_supply/bq24190-charger/f_iinlim";
 	const char *file_f_en_hiz =
 		"/sys/class/power_supply/bq24190-charger/f_en_hiz";
-	char buf[8];
+	const char *file_f_iinlim =
+		"/sys/class/power_supply/bq24190-charger/f_iinlim";
+	char buf[BUF_SZ];
 	int res;
 
-	if (val > BQ24190_MAX_3000MA)
-		val = BQ24190_MAX_3000MA;
-
 	if (gpio) {
-		int gpio_val;
-
-		if (val > BQ24190_MAX_500MA)
-			gpio_val = 1;
-		else
-			gpio_val = 0;
-
-		res = set_gpio(gpio, gpio_val);
+		res = set_gpio(gpio, value);
 		if (res)
 			return res;
 	}
 
-	sprintf(buf, "%i\n", val);
-	if (desc)
-		fprintf(stderr, "WARNING: Forcing charger current to %imA, %s\n",
-			charger_current[val], desc);
-	res = write_sysfs_entry(file_f_iinlim, buf, 2);
-	if (res < 0)
-		return -EINVAL;
 	sprintf(buf, "%i\n", 0);
 	res = write_sysfs_entry(file_f_en_hiz, buf, 2);
 	if (res < 0)
 		return -EINVAL;
 
-	return 0;
-}
-
-/* By defauilt, set max 1500mA and GPIO down */
-static int set_charger_defaults(int gpio)
-{
-	int res;
-
-	res = force_charger_current(BQ24190_MAX_100MA, gpio, NULL);
-	if (res)
-		return res;
-
-	res = force_charger_current(BQ24190_MAX_1500MA, 0, NULL);
-	if (res)
-		return res;
-
-	return 0;
-}
-
-static int dumb_charger_retries;
-
-static int configure_charger(unsigned int status, int gpio,
-	enum charger_current_val *max_current)
-{
-	int res, b_idle, enumerated, charging;
-
-	*max_current = BQ24190_MAX_100MA;
-
-	if (!status)
-		goto out;
-
-	b_idle = (status & (B_IDLE | VBUS)) == ((B_IDLE | VBUS));
-	enumerated = ((status & (B_PERIPHERAL | VBUS)) == (B_PERIPHERAL | VBUS));
-	charging = (status & CHARGING);
-
-	/* We need minimum 700ms sleep for bq24190 charger detection */
-	if ((status & VBUS) && !enumerated) {
-		if (debug)
-			printf("Delaying enumeration for charger detect...\n");
-		sleep(1);
-	}
-
-	if (b_idle || enumerated || charging) {
-		const char *file_f_iinlim =
-			"/sys/class/power_supply/bq24190-charger/f_iinlim";
-		const char *file_f_vbus_stat =
-			"/sys/class/power_supply/bq24190-charger/f_vbus_stat";
-		const char *file_battery_stat =
-			"/sys/class/power_supply/bq24190-battery/status";
-
-		int f_iinlim, f_vbus_stat;
-		char buf[BUF_SZ];
-		char *charger_desc = NULL;
-
-		res = read_sysfs_entry(file_f_iinlim, buf);
-		if (res < 1)
-			return -EINVAL;
-		f_iinlim = atoi(buf);
-		if (f_iinlim >= MAX_CURRENT)
-			f_iinlim = 0;
-
-		res = read_sysfs_entry(file_f_vbus_stat, buf);
-		if (res < 1)
-			return -EINVAL;
-		f_vbus_stat = atoi(buf);
-
-		switch (f_vbus_stat) {
-		case CHARGER_UNKNOWN:
-			charger_desc = "unkown";
-			dumb_charger_retries++;
-			*max_current = BQ24190_MAX_1500MA;
-
-			/* Workaround for dumb charger with d+ and d- shorted */
-			if ((dumb_charger_retries > 2) && (b_idle || enumerated) &&
-			    (f_iinlim) == 0) {
-				res = force_charger_current(*max_current,
-					gpio, "dumb charger?");
-				if (res < 0)
-					return -EINVAL;
-			}
-			break;
-		case CHARGER_USBHOST:
-			charger_desc = "USB host";
-			dumb_charger_retries = 0;
-
-			/* Workaround for bq24190 OTG pin being high */
-			if (b_idle && (f_iinlim > 0)) {
-				*max_current = BQ24190_MAX_100MA; 
-				res = force_charger_current(*max_current,
-					gpio, "OTG pin high?");
-				if (res < 0)
-					return -EINVAL;
-			} else if (enumerated) {
-				*max_current = BQ24190_MAX_500MA; 
-				res = force_charger_current(*max_current,
-					gpio, NULL);
-				if (res < 0)
-					return -EINVAL;
-			}
-			break;
-		case CHARGER_ADAPTER:
-			charger_desc = "adapter port";
-			dumb_charger_retries = 0;
-			*max_current = BQ24190_MAX_1500MA;
-			if (enumerated) {
-				res = force_charger_current(*max_current,
-					gpio, NULL);
-				if (res < 0)
-					return -EINVAL;
-			}
-			break;
-		case CHARGER_OTG:
-			charger_desc = "OTG";
-			dumb_charger_retries = 0;
-			break;
-		default:
-			dumb_charger_retries = 0;
-			break;
-		}
-
-		res = read_sysfs_entry(file_battery_stat, buf);
-		if (res < 1)
-			return -EINVAL;
-
-		if (debug)
-			printf("%s %s %s charger %umA vbus: %i\n",
-			       buf, enumerated ? "enumerated" : "b_idle",
-			       charger_desc, to_max_current(*max_current),
-			       f_vbus_stat);
-
-		if (!strcmp("Full", buf)) {
-			configure_charger_led(255, 1);
-		} else if (!strcmp("Not charging", buf) ||
-				!strcmp("Discharging", buf)) {
-			configure_charger_led(0, 0);
-			res = set_charger_defaults(gpio);
-			if (res)
-				return res;
-			else
-				return -EAGAIN;
-		} else {
-			configure_charger_led(1 + (32 * f_iinlim), 0);
-		}
-
-		return 0;
-	}
-
-out:
-	dumb_charger_retries = 0;
-	configure_charger_led(0, 0);
-	res = force_charger_current(*max_current, gpio, NULL);
+	sprintf(buf, "%i\n", max_current);
+	res = write_sysfs_entry(file_f_iinlim, buf, 2);
 	if (res < 0)
 		return -EINVAL;
+
+	return 0;
+}
+#define grr printf("XXX %s: %i\n", __func__, __LINE__);
+static int get_charger_status(struct charger_status *c, int gpio)
+{
+	const char *file_f_vbus_stat =
+		"/sys/class/power_supply/bq24190-charger/f_vbus_stat";
+	const char *file_f_iinlim =
+		"/sys/class/power_supply/bq24190-charger/f_iinlim";
+	const char *file_battery_stat =
+		"/sys/class/power_supply/bq24190-battery/status";
+	char buf[BUF_SZ];
+	int res;
+
+	memset(c, 0, sizeof(*c));
+
+	if (gpio)
+		c->gpio = get_gpio(gpio);
+
+	res = read_sysfs_entry(file_f_vbus_stat, buf);
+	if (res < 1)
+		return -EINVAL;
+	c->type = atoi(buf);
+	if (c->type > CHARGER_OTG)
+		c->type = CHARGER_UNKNOWN;
+
+	res = read_sysfs_entry(file_f_iinlim, buf);
+	if (res < 1)
+		return -EINVAL;
+	c->current = atoi(buf);
+	if (c->current >= BQ24190_MAX_3000MA)
+		c->current = BQ24190_MAX_100MA;
+
+	res = read_sysfs_entry(file_battery_stat, buf);
+	if (res < 1)
+		return -EINVAL;
+
+	if (!strcmp("Full", buf)) {
+		c->status = CHARGE_STATUS_FULL;
+		configure_charger_led(255, 1);
+	} else if (!strcmp("Not charging", buf)) {
+		c->status = CHARGE_STATUS_NOT_CHARGING;
+		configure_charger_led(0, 0);
+	} else if (!strcmp("Discharging", buf)) {
+		c->status = CHARGE_STATUS_DISCHARGING;
+		configure_charger_led(0, 0);
+	} else if (!strcmp("Charging", buf)) {
+		c->status = CHARGE_STATUS_CHARGING;
+		configure_charger_led(1 + (32 * c->current), 0);
+	} else {
+		c->status = CHARGE_STATUS_UNKNOWN;
+		configure_charger_led(0, 0);
+	}
 
 	return 0;
 }
@@ -751,7 +669,6 @@ static int configure_usb_gadget(int connected, int max_current)
 			cc = usbg_get_config(g, 1, NULL);
 			if (cc) {
 				int max = to_max_current(max_current);
-
 				if (max == 100)
 					max = 500;
 				ret = usbg_set_config_max_power(cc, max / 2);
@@ -889,9 +806,7 @@ static int configure_usb_console(int connected)
 
 static void signal_handler(int signal)
 {
-	enum charger_current_val max_current;
-
-	configure_charger(0, gpio, &max_current);
+	set_charger(BQ24190_MAX_100MA, gpio, 0);
 	configure_usb_console(0);
 	configure_usb_gadget(0, BQ24190_MAX_100MA);
 	free_sysfs_entries(sysfs);
@@ -931,7 +846,7 @@ int main(int argc, char **argv)
 			gpio = 0;
 	}
 
-	ret = set_charger_defaults(gpio);
+	ret = set_charger(BQ24190_MAX_100MA, gpio, 0);
 	if (ret)
 		goto free;
 
@@ -947,25 +862,45 @@ int main(int argc, char **argv)
 
 	/* Keep checking when state changes */
 	while (1) {
-		enum charger_current_val max_current;
+		struct charger_status c;
 
 		ret = poll_vbus(sysfs, timeout_ms, mask, &status_changed, &status);
 		if (ret)
 			goto free;
 
 		if (status_changed || recheck)  {
-			ret = configure_charger(status, gpio, &max_current);
-			if (ret == -EAGAIN) {
-				status = CHARGER_FAILED;
-				status_changed = 1;
-			} else if (ret) {
-				goto free;
-			}
+			if (status & VBUS)
+				sleep(1);
+			ret = get_charger_status(&c, gpio);
+			if (ret)
+				continue;
+
+			if (c.status == CHARGE_STATUS_DISCHARGING)
+				status &= ~VBUS;
+
+			if ((c.type == CHARGER_USBHOST) &&
+					(c.current == BQ24190_MAX_100MA))
+				c.current = BQ24190_MAX_500MA;
+
+			if (debug)
+				printf("status: 0x%08x charger status: %i "
+					"current: %i type: %i gpio: %i\n",
+					status, c.status, c.current, c.type, c.gpio);
 		}
 
 		if (status_changed) {
-			ret = configure_usb_gadget(status & VBUS, max_current);
-			/* Ignore errors in case it was manually configured */
+			int enable;
+
+			if (status & VBUS)
+				enable = 1;
+			else
+				enable = 0;
+			ret = configure_usb_gadget(enable, c.current);
+			if (!ret) {
+				ret = set_charger(c.current, gpio, enable);
+				if (ret)
+					return ret;
+			}
 		}
 
 		if (status_changed) {
@@ -982,8 +917,7 @@ int main(int argc, char **argv)
 		if (status & CHARGING) {
 			timeout_ms = 5000;
 			recheck = 1;
-		} else if (B_IDLE_VBUS(status) || (status & B_PERIPHERAL) ||
-				(status & CHARGER_FAILED)) {
+		} else if (B_IDLE_VBUS(status) || (status & B_PERIPHERAL)) {
 			timeout_ms = 1000;
 			recheck = 1;
 		} else {
